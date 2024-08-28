@@ -154,7 +154,7 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, _input, target, ignore_index):
+    def forward(ctx, _input, target, ignore_index, reduction="mean"):
         """
         The forward pass of the Liger Cross Entropy loss.
 
@@ -163,6 +163,7 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
         _input (tensor): The input tensor of shape (BT, V) where B is batch size, T is sequence length, V is vocab size.
         target (tensor): The target tensor of shape (BT) where each value is in [0, V-1].
         ignore_index (int): The index to ignore in the target.
+        reduction (str):  The reduction to apply to the output: "none" | "mean | "sum".
 
         Returns:
         tensor: The computed loss.
@@ -175,7 +176,13 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
         # unreduced loss
         loss_1d = torch.zeros(n_rows, dtype=_input.dtype, device=_input.device)
 
-        n_non_ignore = (target != ignore_index).sum().item()
+        # n_non_ignore is only meaningful when reduction == "mean"
+        # Otherwise, we simply set it to 1, so kernel structure can remain unchanged while performing correct calculation
+        # Downside is two redundant (divide by 1) operations when reduction == "sum"
+        if reduction == "mean":
+            n_non_ignore = (target != ignore_index).sum().item()
+        else:
+            n_non_ignore = 1
 
         # ensure _input and target are contiguous in the last dimension
         if _input.stride(-1) != 1:
@@ -200,7 +207,10 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
             num_warps=32,
         )
 
-        loss = torch.sum(loss_1d) / n_non_ignore
+        if reduction == "none":
+            loss = loss_1d
+        else:
+            loss = torch.sum(loss_1d) / n_non_ignore
 
         # TODO: investigation
         # If we don't detach the _input tensor, the memory will double
@@ -241,8 +251,4 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
                 num_warps=32,
             )
 
-        return (
-            _input,
-            None,
-            None,
-        )
+        return (_input, None, None, None)
