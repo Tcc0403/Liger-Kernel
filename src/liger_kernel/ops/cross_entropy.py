@@ -112,7 +112,7 @@ MAX_FUSED_SIZE = 65536 // 2  # the best size we found by manually tuning
 
 
 @triton.jit
-def element_mul(
+def element_mul_kernel(
     X_ptr,
     X_stride,
     grad_output_ptr,
@@ -147,6 +147,78 @@ def element_mul(
         tl.store(X_ptr + X_offsets, X_block * grad_output, mask=X_offsets < n_cols)
 
 
+def cross_entropy_forward(_input, target, ignore_index, reduction):
+    BT, V = _input.shape
+    n_rows = BT
+
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
+
+    # unreduced loss
+    loss_1d = torch.zeros(n_rows, dtype=_input.dtype, device=_input.device)
+
+    # n_non_ignore is only meaningful when reduction == "mean"
+    # Otherwise, we simply set it to 1, so kernel structure can remain unchanged while performing correct calculation
+    # Downside is two redundant (divide by 1) operations when reduction == "sum"
+    if reduction == "mean":
+        n_non_ignore = (target != ignore_index).sum().item()
+    else:
+        n_non_ignore = 1
+
+    # ensure _input and target are contiguous in the last dimension
+    if _input.stride(-1) != 1:
+        _input = _input.contiguous()
+    if target.stride(-1) != 1:
+        target = target.contiguous()
+
+    # Here we use a trick to store X_ptr gradient in X_ptr so we can save memory
+    liger_cross_entropy_kernel[(n_rows,)](
+        X_ptr=_input,
+        X_stride=_input.stride(-2),
+        Y_ptr=target,
+        Y_stride=target.stride(-1),  # always 1
+        loss_ptr=loss_1d,
+        loss_stride=loss_1d.stride(-1),  # always 1
+        n_cols=V,
+        n_non_ignore=n_non_ignore,
+        ignore_index=ignore_index,
+        BLOCK_SIZE=BLOCK_SIZE,
+        # TODO: 32 seems to give the best performance
+        # Performance is quite sensitive to num_warps
+        num_warps=32,
+    )
+
+    if reduction == "none":
+        loss = loss_1d
+    else:
+        loss = torch.sum(loss_1d) / n_non_ignore
+
+    return loss, _input
+
+
+def cross_entropy_backward(_input, grad_output):
+    # If cross entropy is the last layer, grad_output is 1.0. Skip the mul to save time
+    if torch.equal(grad_output, torch.tensor(1.0, device=grad_output.device)):
+        pass
+
+    # We use a Triton kernel instead of a PyTorch operation because modifying inputs in-place
+    # for gradient storage and backward multiple times causes anomalies with PyTorch but not with Triton.
+    else:
+        BT, V = _input.shape
+        n_rows = BT
+        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
+
+        element_mul_kernel[(n_rows,)](
+            _input,
+            _input.stride(-2),
+            grad_output,
+            V,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=32,
+        )
+
+    return _input
+
+
 class LigerCrossEntropyFunction(torch.autograd.Function):
     """
     This class implements a custom autograd function for the Liger Cross Entropy loss.
@@ -154,7 +226,7 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, _input, target, ignore_index, reduction="mean"):
+    def forward(ctx, _input, target, ignore_index=-100, reduction="mean"):
         """
         The forward pass of the Liger Cross Entropy loss.
 
@@ -163,55 +235,11 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
         _input (tensor): The input tensor of shape (BT, V) where B is batch size, T is sequence length, V is vocab size.
         target (tensor): The target tensor of shape (BT) where each value is in [0, V-1].
         ignore_index (int): The index to ignore in the target.
-        reduction (str):  The reduction to apply to the output: "none" | "mean | "sum".
 
         Returns:
         tensor: The computed loss.
         """
-        BT, V = _input.shape
-        n_rows = BT
-
-        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
-
-        # unreduced loss
-        loss_1d = torch.zeros(n_rows, dtype=_input.dtype, device=_input.device)
-
-        # n_non_ignore is only meaningful when reduction == "mean"
-        # Otherwise, we simply set it to 1, so kernel structure can remain unchanged while performing correct calculation
-        # Downside is two redundant (divide by 1) operations when reduction == "sum"
-        if reduction == "mean":
-            n_non_ignore = (target != ignore_index).sum().item()
-        else:
-            n_non_ignore = 1
-
-        # ensure _input and target are contiguous in the last dimension
-        if _input.stride(-1) != 1:
-            _input = _input.contiguous()
-        if target.stride(-1) != 1:
-            target = target.contiguous()
-
-        # Here we use a trick to store X_ptr gradient in X_ptr so we can save memory
-        liger_cross_entropy_kernel[(n_rows,)](
-            X_ptr=_input,
-            X_stride=_input.stride(-2),
-            Y_ptr=target,
-            Y_stride=target.stride(-1),  # always 1
-            loss_ptr=loss_1d,
-            loss_stride=loss_1d.stride(-1),  # always 1
-            n_cols=V,
-            n_non_ignore=n_non_ignore,
-            ignore_index=ignore_index,
-            BLOCK_SIZE=BLOCK_SIZE,
-            # TODO: 32 seems to give the best performance
-            # Performance is quite sensitive to num_warps
-            num_warps=32,
-        )
-
-        if reduction == "none":
-            loss = loss_1d
-        else:
-            loss = torch.sum(loss_1d) / n_non_ignore
-
+        loss, _input = cross_entropy_forward(_input, target, ignore_index, reduction)
         # TODO: investigation
         # If we don't detach the _input tensor, the memory will double
         # Not sure why but seems that there will be a time both grad and value exist but in different location
@@ -231,24 +259,11 @@ class LigerCrossEntropyFunction(torch.autograd.Function):
         tuple: A tuple with the gradients with respect to the inputs. The elements are tensors or None.
         """
         (_input,) = ctx.saved_tensors
-        # If cross entropy is the last layer, grad_output is 1.0. Skip the mul to save time
-        if torch.equal(grad_output, torch.tensor(1.0, device=grad_output.device)):
-            pass
+        _input = cross_entropy_backward(_input, grad_output)
 
-        # We use a Triton kernel instead of a PyTorch operation because modifying inputs in-place
-        # for gradient storage and backward multiple times causes anomalies with PyTorch but not with Triton.
-        else:
-            BT, V = _input.shape
-            n_rows = BT
-            BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
-
-            element_mul[(n_rows,)](
-                _input,
-                _input.stride(-2),
-                grad_output,
-                V,
-                BLOCK_SIZE=BLOCK_SIZE,
-                num_warps=32,
-            )
-
-        return (_input, None, None, None)
+        return (
+            _input,
+            None,
+            None,
+            None,
+        )
